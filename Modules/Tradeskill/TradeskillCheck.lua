@@ -23,6 +23,129 @@ function DP_TradeSkillCheck:IsEnchantingProfessionInfo(professionInfo)
     or professionInfo.professionName == DisenchanterPlus:DP_i18n("Enchanting")
 end
 
+function DP_TradeSkillCheck:IsOwnEnchantingOpen()
+  if not (C_TradeSkillUI and C_TradeSkillUI.GetBaseProfessionInfo) then return false end
+  return DP_TradeSkillCheck:IsEnchantingProfessionInfo(C_TradeSkillUI.GetBaseProfessionInfo())
+      and not (C_TradeSkillUI.IsTradeSkillLinked and C_TradeSkillUI.IsTradeSkillLinked())
+      and not (C_TradeSkillUI.IsTradeSkillGuild and C_TradeSkillUI.IsTradeSkillGuild())
+end
+
+local recipeFilterAPI = {
+  filterSkillUp = { "GetOnlyShowSkillUpRecipes", "SetOnlyShowSkillUpRecipes" },
+  filterWithoutMaterials = { "GetOnlyShowMakeableRecipes", "SetOnlyShowMakeableRecipes" },
+}
+local addonEnchantSlots
+
+local function GetNativeRecipeFilter(key)
+  if not DisenchanterPlus.IsForever or not DP_TradeSkillCheck:IsOwnEnchantingOpen() then return end
+  local api = recipeFilterAPI[key]
+  local getter, setter = C_TradeSkillUI[api[1]], C_TradeSkillUI[api[2]]
+  if getter and setter then return getter, setter end
+end
+
+function DP_TradeSkillCheck:GetRecipeFilter(key)
+  local settings = DisenchanterPlus.db.char.general
+  local pending = settings.pendingEnchantRecipeFilters[key]
+  if pending ~= nil then return pending end
+  local getter = GetNativeRecipeFilter(key)
+  if getter then return getter() == true end
+  return settings[key] == true
+end
+
+local function UpdateNativeFilterButton()
+  local craftingPage = ProfessionsFrame and ProfessionsFrame.CraftingPage
+  local recipeList = craftingPage and craftingPage.RecipeList
+  local dropdown = recipeList and recipeList.FilterDropdown
+  if dropdown and dropdown.ValidateResetState then dropdown:ValidateResetState() end
+end
+
+function DP_TradeSkillCheck:SetRecipeFilter(key, enabled)
+  local settings = DisenchanterPlus.db.char.general
+  settings[key] = enabled
+  local pending = settings.pendingEnchantRecipeFilters
+  local getter, setter = GetNativeRecipeFilter(key)
+  if not setter or InCombatLockdown() then
+    if DisenchanterPlus.IsForever then pending[key] = enabled end
+    return
+  end
+
+  if getter() ~= enabled then
+    setter(enabled)
+    UpdateNativeFilterButton()
+  end
+  pending[key] = nil
+end
+
+function DP_TradeSkillCheck:ApplyPendingRecipeFilters()
+  local pending = DisenchanterPlus.db.char.general.pendingEnchantRecipeFilters
+  if not next(pending) or not self:IsOwnEnchantingOpen() or InCombatLockdown() then return end
+  for key, enabled in pairs(pending) do
+    self:SetRecipeFilter(key, enabled)
+  end
+end
+
+---Get the active native slot filter by its localized menu labels.
+function DP_TradeSkillCheck:GetEnchantSlotFilters(includeUnfiltered)
+  if not DisenchanterPlus.IsForever or not self:IsOwnEnchantingOpen() then return end
+  if not (C_TradeSkillUI.GetAllFilterableInventorySlotsCount and C_TradeSkillUI.GetFilterableInventorySlotName
+      and C_TradeSkillUI.IsInventorySlotFiltered) then return end
+
+  local slots = {}
+  local indices = {}
+  local anyFiltered = false
+  for index = 1, C_TradeSkillUI.GetAllFilterableInventorySlotsCount() do
+    local name = C_TradeSkillUI.GetFilterableInventorySlotName(index)
+    local filtered = C_TradeSkillUI.IsInventorySlotFiltered(index)
+    if addonEnchantSlots and filtered ~= (not addonEnchantSlots[index]) then
+      addonEnchantSlots = nil
+    end
+    if type(name) == "string" and name ~= "" then
+      local key = string.lower(name)
+      if not indices[key] or not filtered then indices[key] = index end
+      slots[key] = slots[key] or not filtered
+      anyFiltered = anyFiltered or filtered
+    end
+  end
+  if anyFiltered or includeUnfiltered then return slots, indices end
+end
+
+local function MatchesEnchantSlots(selectedSlots)
+  for slot = 1, C_TradeSkillUI.GetAllFilterableInventorySlotsCount() do
+    if C_TradeSkillUI.IsInventorySlotFiltered(slot) ~= (not selectedSlots[slot]) then return false end
+  end
+  return true
+end
+
+function DP_TradeSkillCheck:SelectEnchantSlots(index, weaponIndex)
+  index = index or weaponIndex
+  if not index or InCombatLockdown() or not DisenchanterPlus.IsForever or not self:IsOwnEnchantingOpen()
+      or not C_TradeSkillUI.SetInventorySlotFilter then return false end
+
+  local selectedSlots = { [index] = true }
+  if weaponIndex then selectedSlots[weaponIndex] = true end
+  if MatchesEnchantSlots(selectedSlots) then return false end
+
+  C_TradeSkillUI.SetInventorySlotFilter(index, true, true)
+  if weaponIndex and weaponIndex ~= index then
+    C_TradeSkillUI.SetInventorySlotFilter(weaponIndex, true)
+  end
+  addonEnchantSlots = selectedSlots
+  UpdateNativeFilterButton()
+  return true
+end
+
+function DP_TradeSkillCheck:ClearEnchantSlot()
+  if not addonEnchantSlots or InCombatLockdown() or not DisenchanterPlus.IsForever or not self:IsOwnEnchantingOpen()
+      or not C_TradeSkillUI.ClearInventorySlotFilter then return false end
+
+  local selectedSlots = addonEnchantSlots
+  addonEnchantSlots = nil
+  if not MatchesEnchantSlots(selectedSlots) then return false end
+  C_TradeSkillUI.ClearInventorySlotFilter()
+  UpdateNativeFilterButton()
+  return true
+end
+
 ---Get tradeSkill
 ---@return table|nil
 function DP_TradeSkillCheck:GetTradeSkill()
@@ -101,6 +224,7 @@ end
 
 ---Populate tradeSkill lines
 ---@return table
+---@return boolean? nativeFiltersApplied
 function DP_TradeSkillCheck:GetTradeSkillLines()
   if DisenchanterPlus.IsForever then
     -- Forever / modern client
@@ -130,17 +254,20 @@ local function GetCraftTypeFromRelativeDifficulty(relativeDifficulty)
   return difficultyMap[relativeDifficulty] or "optimal"
 end
 
+local function CanCraftSkillUp(craftType)
+  return craftType == "optimal" or craftType == "medium" or craftType == "easy"
+end
+
 ---Get tradeskill lines for Forever / modern clients (C_TradeSkillUI)
 ---@return table
+---@return boolean? nativeFiltersApplied
 function DP_TradeSkillCheck:GetTradeSkillLinesForForever()
   local lines = {}
   if not (C_TradeSkillUI and C_TradeSkillUI.GetFilteredRecipeIDs) then
     return lines
   end
 
-  -- GetFilteredRecipeIDs() lists the recipes of whichever profession is open, so only read them when Enchanting is the open one.
-  local baseInfo = C_TradeSkillUI.GetBaseProfessionInfo and C_TradeSkillUI.GetBaseProfessionInfo()
-  if not DP_TradeSkillCheck:IsEnchantingProfessionInfo(baseInfo) then
+  if not self:IsOwnEnchantingOpen() then
     return lines
   end
 
@@ -152,7 +279,7 @@ function DP_TradeSkillCheck:GetTradeSkillLinesForForever()
   for _, recipeID in ipairs(recipeIDs) do
     local recipeInfo = C_TradeSkillUI.GetRecipeInfo(recipeID)
     -- Skip unlearned / dummy recipes, matching the classic GetCraftInfo behavior.
-    if recipeInfo and recipeInfo.learned ~= false and not recipeInfo.isDummyRecipe then
+    if recipeInfo and recipeInfo.learned and not recipeInfo.isDummyRecipe then
       local reagents = {}
       local schematic = C_TradeSkillUI.GetRecipeSchematic(recipeID, false)
       if schematic and schematic.reagentSlotSchematics then
@@ -184,17 +311,21 @@ function DP_TradeSkillCheck:GetTradeSkillLinesForForever()
         end
       end
 
+      local craftType = GetCraftTypeFromRelativeDifficulty(recipeInfo.relativeDifficulty)
+      if recipeInfo.canSkillUp == false then
+        craftType = "trivial"
+      end
       table.insert(lines, {
         Index = recipeID,
         CraftName = recipeInfo.name,
         CraftDescription = craftDescription,
-        CraftType = GetCraftTypeFromRelativeDifficulty(recipeInfo.relativeDifficulty),
+        CraftType = craftType,
         NumAvailable = C_TradeSkillUI.GetCraftableCount(recipeID) or 0,
         Reagents = reagents
       })
     end
   end
-  return lines
+  return lines, true
 end
 
 ---Get tradeskill lines for classic
@@ -244,6 +375,7 @@ function DP_TradeSkillCheck:GetTradeSkillLinesForClassic()
       CraftName = craftName,
       CraftDescription = craftDescription,
       CraftType = craftType,
+      CanSkillUp = CanCraftSkillUp(craftType),
       NumAvailable = numAvailable,
       Reagents = reagents
     }
